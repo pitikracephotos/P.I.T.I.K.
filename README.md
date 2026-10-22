@@ -1,4 +1,5 @@
-# P.I.T.I.K. FindMyShots Automation
+# P.I.T.I.K. 
+Photo Identification Tracker Instant Keeper
 
 ## Files
 - `main.py`: Playwright automation and Google Drive input/output handling.
