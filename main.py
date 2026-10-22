@@ -1,95 +1,160 @@
-import io
-import mimetypes
-import re
-import time
-from pathlib import Path
-from urllib.parse import urlparse
-
-import yaml
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from playwright.sync_api import (
-    BrowserContext,
-    Page,
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-)
-
-BASE_URL = "https://findmyshots.com"
-EVENTS_URL = f"{BASE_URL}/events"
-FIREBASE_BASE_URL_TEMPLATE = (
-    "https://firebasestorage.googleapis.com/v0/b/"
-    "proj-lamatsapitik-458606.firebasestorage.app/o/"
-    "events%2F{event_id}%2Fphotos%2F"
-)
-
-BASE_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = BASE_DIR / "config.yml"
-TOKEN_FILE = BASE_DIR / "token.json"
-WORK_DIR = BASE_DIR / "work"
-DOWNLOADS_DIR = BASE_DIR / "downloads"
-
-# Google Drive folder IDs: configure these here instead of in config.yml.
-INPUT_FOLDER_ID = "11zh8F_XGE0xeRvCx9yRM4ikWtiysQTP8"
-OUTPUT_FOLDER_ID = "1dveODIwUwxLT77dsGLHZbkKRC0M6I06s"
-
-DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+    return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
-def load_config() -> dict:
-    """Load and validate config.yml."""
-    if not CONFIG_FILE.exists():
-        raise FileNotFoundError(f"Missing configuration file: {CONFIG_FILE}")
+def list_drive_files(service, folder_id: str) -> list[dict]:
+    """List all non-trashed files directly inside a Drive folder."""
+    files = []
+    page_token = None
 
-    with CONFIG_FILE.open("r", encoding="utf-8") as file:
-        config = yaml.safe_load(file) or {}
-
-    search_term = config.get("search_term")
-    upload_images = config.get("upload_images")
-    if not isinstance(search_term, str) or not search_term.strip():
-        raise ValueError("config.yml must contain a non-empty search_term.")
-
-    if not isinstance(upload_images, list) or not upload_images:
-        raise ValueError(
-            "config.yml must contain at least one filename under upload_images."
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=f"'{folder_id}' in parents and trashed = false",
+                pageSize=1000,
+                pageToken=page_token,
+                orderBy="name",
+                fields="nextPageToken, files(id, name, mimeType, size)",
+            )
+            .execute()
         )
+        files.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
 
-    if not all(isinstance(name, str) and name.strip() for name in upload_images):
-        raise ValueError("Every upload_images entry must be a non-empty filename.")
-
-    if not INPUT_FOLDER_ID or "YOUR_" in INPUT_FOLDER_ID:
-        raise ValueError("Set INPUT_FOLDER_ID in main.py.")
-    if not OUTPUT_FOLDER_ID or "YOUR_" in OUTPUT_FOLDER_ID:
-        raise ValueError("Set OUTPUT_FOLDER_ID in main.py.")
-
-    # Preserve order but avoid processing a filename more than once.
-    config["upload_images"] = list(dict.fromkeys(name.strip() for name in upload_images))
-    config["search_term"] = search_term.strip()
-    return config
+    return files
 
 
-def get_drive_service():
-    """Create a Google Drive API client using the locally restored OAuth token."""
-    if not TOKEN_FILE.exists():
-        raise FileNotFoundError(
-            "token.json is missing. The GitHub workflow should create it from "
-            "the GOOGLE_OAUTH_TOKEN repository secret."
+def download_drive_file(service, file_id: str, destination: Path) -> Path:
+    """Download a Drive file to the given local path."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    request = service.files().get_media(fileId=file_id)
+
+    with destination.open("wb") as file_handle:
+        downloader = MediaIoBaseDownload(file_handle, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+
+    return destination
+
+
+def get_or_create_drive_folder(service, parent_id: str, folder_name: str) -> str:
+    """Find a child folder by name, or create it if it doesn't exist."""
+    escaped_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+    query = (
+        f"name = '{escaped_name}' and "
+        f"mimeType = '{DRIVE_FOLDER_MIME}' and "
+        f"'{parent_id}' in parents and trashed = false"
+    )
+    response = (
+        service.files()
+        .list(
+            q=query,
+            pageSize=100,
+            fields="files(id, name)",
         )
+        .execute()
+    )
+    folders = response.get("files", [])
+    if folders:
+        return folders[0]["id"]
 
-    credentials = Credentials.from_authorized_user_file(
-        str(TOKEN_FILE),
-        scopes=SCOPES,
+    metadata = {
+        "name": folder_name,
+        "mimeType": DRIVE_FOLDER_MIME,
+        "parents": [parent_id],
+    }
+    created = service.files().create(
+        body=metadata,
+        fields="id",
+    ).execute()
+    print(f"Created Google Drive folder: {folder_name}")
+    return created["id"]
+
+
+def upload_file_to_drive(service, local_path: Path, folder_id: str) -> None:
+    """Upload a file unless a same-named file already exists in the destination."""
+    escaped_name = local_path.name.replace("\\", "\\\\").replace("'", "\\'")
+    query = (
+        f"name = '{escaped_name}' and "
+        f"'{folder_id}' in parents and trashed = false"
+    )
+    response = (
+        service.files()
+        .list(
+            q=query,
+            pageSize=100,
+            fields="files(id, name)",
+        )
+        .execute()
+    )
+    existing = response.get("files", [])
+
+    if existing:
+        print(f"Skipped existing file: {local_path.name}")
+        return
+
+    mime_type = mimetypes.guess_type(local_path.name)[0] or "application/octet-stream"
+    media = MediaFileUpload(
+        str(local_path),
+        mimetype=mime_type,
+        resumable=True,
+    )
+    service.files().create(
+        body={"name": local_path.name, "parents": [folder_id]},
+        media_body=media,
+        fields="id",
+    ).execute()
+    print(f"Uploaded to Drive: {local_path.name}")
+
+
+def upload_folder_contents(service, local_folder: Path, drive_folder_id: str) -> None:
+    """Upload the files in one runner's local result folder to its Drive folder."""
+    if not local_folder.exists():
+        return
+
+    for path in sorted(local_folder.iterdir()):
+        if path.is_file():
+            upload_file_to_drive(service, path, drive_folder_id)
+
+
+def extract_filename(content_disposition: str | None) -> str | None:
+    """Extract filename from Content-Disposition header."""
+    if not content_disposition:
+        return None
+
+    match = re.search(
+        r'filename="([^"]+)"',
+        content_disposition,
+        re.IGNORECASE,
     )
 
-    if credentials.expired and credentials.refresh_token:
-        credentials.refresh(Request())
-        TOKEN_FILE.write_text(credentials.to_json(), encoding="utf-8")
+    if match:
+        filename = match.group(1)
+        if filename.lower().endswith(".webp"):
+            filename = filename[:-5] + ".JPG"
+        return filename
 
-    if not credentials.valid:
-        raise RuntimeError(
-            "Google OAuth credentials are not valid. Re-authorize Google Drive "
-            "and update the GOOGLE_OAUTH_TOKEN GitHub secret."
-        )
+    # Also handle unquoted filename values.
+    match = re.search(
+        r"filename=([^;]+)",
+        content_disposition,
+        re.IGNORECASE,
+    )
+    if match:
+        filename = match.group(1).strip().strip('"')
+        if filename.lower().endswith(".webp"):
+            filename = filename[:-5] + ".JPG"
+        return filename
+
+    return None
+
+
+def get_original_filename(context: BrowserContext, image_url: str) -> str | None:
+    """Open an image URL and capture its Content-Disposition filename."""
+    image_page = context.new_page()
+
+    try:
+        filename = None
