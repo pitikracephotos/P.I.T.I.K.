@@ -1,0 +1,8 @@
+search_term: "34th Yakult 10-Miler"
+
+# Only these filenames from the Google Drive input folder will be processed.
+# Filenames must match exactly, including capitalization and extension.
+upload_images:
+  - "runner1.png"
+  - "runner2.png"
+  - "runner5.png"
