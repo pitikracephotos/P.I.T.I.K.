@@ -31,8 +31,8 @@ WORK_DIR = BASE_DIR / "work"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 
 # Google Drive folder IDs: configure these here instead of in config.yml.
-INPUT_FOLDER_ID = "YOUR_INPUT_FOLDER_ID"
-OUTPUT_FOLDER_ID = "YOUR_OUTPUT_FOLDER_ID"
+INPUT_FOLDER_ID = "input"
+OUTPUT_FOLDER_ID = "output"
 
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
